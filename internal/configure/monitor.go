@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strconv"
 	"strings"
 
 	"github.com/dingodb/dingocli/cli/cli"
@@ -48,6 +50,7 @@ const (
 	KEY_GRAFANA_PASSWORD  = "password"
 
 	KEY_NODE_IPS         = "node_ips"
+	KEY_NODE_TARGETS     = "node_targets"
 	KRY_NODE_LISTEN_PORT = "node_listen_port"
 	KEY_PROMETHEUS_IP    = "prometheus_listen_ip"
 	KEY_PROMETHEUS_PORT  = "prometheus_listen_port"
@@ -157,6 +160,10 @@ func (m *MonitorConfig) GetNodeIps() []string {
 	return m.getStrings(&m.config, KEY_NODE_IPS)
 }
 
+func (m *MonitorConfig) GetNodeTargets() string {
+	return m.getString(&m.config, KEY_NODE_TARGETS)
+}
+
 func (m *MonitorConfig) GetNodeListenPort() int {
 	return m.getInt(&m.config, KRY_NODE_LISTEN_PORT)
 }
@@ -228,28 +235,108 @@ func (m *MonitorConfig) GetContext() *topology.Context {
 }
 
 func getHost(c *Monitor, role string) []string {
+	deploys := c.NodeExporter.Deploy
+	explicitCentral := false
+	switch role {
+	case ROLE_PROMETHEUS:
+		if len(c.Prometheus.Deploy) > 0 {
+			deploys = c.Prometheus.Deploy
+			explicitCentral = true
+		}
+	case ROLE_GRAFANA:
+		if len(c.Grafana.Deploy) > 0 {
+			deploys = c.Grafana.Deploy
+			explicitCentral = true
+		}
+	case ROLE_MONITOR_SYNC:
+		if len(c.MonitroSync.Deploy) > 0 {
+			deploys = c.MonitroSync.Deploy
+			explicitCentral = true
+		}
+	}
 	hosts := []string{}
-	for _, d := range c.NodeExporter.Deploy {
+	seenHosts := map[string]bool{}
+	for _, d := range deploys {
+		if seenHosts[d.Host] {
+			continue
+		}
+		seenHosts[d.Host] = true
 		hosts = append(hosts, d.Host)
+	}
+	if role != ROLE_NODE_EXPORTER && !explicitCentral && len(hosts) > 0 {
+		hosts = hosts[:1]
 	}
 	switch role {
 	case ROLE_NODE_EXPORTER:
-		if _, ok := c.NodeExporter.Config[KEY_HOST]; ok {
-			return c.NodeExporter.Config[KEY_HOST].([]string)
+		if c.NodeExporter.Config == nil {
+			c.NodeExporter.Config = map[string]interface{}{}
 		}
 		c.NodeExporter.Config[KEY_HOST] = hosts
 	case ROLE_PROMETHEUS:
-		if _, ok := c.Prometheus.Config[KEY_HOST]; ok {
-			return c.Prometheus.Config[KEY_HOST].([]string)
+		if c.Prometheus.Config == nil {
+			c.Prometheus.Config = map[string]interface{}{}
 		}
 		c.Prometheus.Config[KEY_HOST] = hosts
 	case ROLE_GRAFANA:
-		if _, ok := c.Grafana.Config[KEY_HOST]; ok {
-			return c.Grafana.Config[KEY_HOST].([]string)
+		if c.Grafana.Config == nil {
+			c.Grafana.Config = map[string]interface{}{}
 		}
 		c.Grafana.Config[KEY_HOST] = hosts
 	}
 	return hosts
+}
+
+func validateMonitorPlacement(c *Monitor, ctx *topology.Context, roles []string) error {
+	central := ""
+	for _, role := range roles {
+		if role == ROLE_NODE_EXPORTER {
+			continue
+		}
+		hosts := getHost(c, role)
+		if len(hosts) != 1 || ctx.Lookup(hosts[0]) == "" {
+			return fmt.Errorf("monitor role %s requires one registered central host", role)
+		}
+		if central != "" && hosts[0] != central {
+			return fmt.Errorf("prometheus, grafana and monitor_sync must share one host for their local endpoints")
+		}
+		central = hosts[0]
+	}
+	return nil
+}
+
+// Resolve the explicitly configured monitoring hosts, including clients and
+// caches that are absent from the metadata-service deployment topology.
+func monitorNodeTargets(c *Monitor, ctx *topology.Context, cluster string) ([]string, string, error) {
+	seen := map[string]bool{}
+	addresses := map[string]string{}
+	ips := []string{}
+	targets := []serviceTarget{}
+	port, ok := c.NodeExporter.Config[KEY_LISTEN_PORT].(int)
+	if !ok || port <= 0 || port > 65535 {
+		return nil, "", fmt.Errorf("invalid node_exporter listen_port")
+	}
+	for _, host := range getHost(c, ROLE_NODE_EXPORTER) {
+		if seen[host] {
+			continue
+		}
+		seen[host] = true
+		ip := ctx.Lookup(host)
+		if ip == "" {
+			return nil, "", fmt.Errorf("monitor host %q is not registered in dingo hosts", host)
+		}
+		if other, exists := addresses[ip]; exists && other != host {
+			return nil, "", fmt.Errorf("monitor hosts %q and %q share address %q", other, host, ip)
+		}
+		addresses[ip] = host
+		ips = append(ips, ip)
+		targets = append(targets, serviceTarget{Targets: []string{net.JoinHostPort(ip, strconv.Itoa(port))},
+			Labels: map[string]string{"cluster": cluster, "component": "host", "node": host, "group": "server"}})
+	}
+	if len(targets) == 0 {
+		return nil, "", fmt.Errorf("node_exporter deploy list must not be empty")
+	}
+	encoded, err := json.Marshal(targets)
+	return ips, string(encoded), err
 }
 
 func parsePrometheusTarget(dcs []*topology.DeployConfig) (string, error) {
@@ -322,7 +409,7 @@ func ParseMonitor(dingocli *cli.DingoCli) ([]*MonitorConfig, error) {
 
 // ParseMonitorFile parses monitor configuration from a file or from existing monitor data. infoType can be "file" or "data".
 func ParseMonitorInfo(dingocli *cli.DingoCli, info string, infoType string) ([]*MonitorConfig, error) {
-	hosts, hostIps, dcs, err := parseHosts(dingocli)
+	_, _, dcs, err := parseHosts(dingocli)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +453,18 @@ func ParseMonitorInfo(dingocli *cli.DingoCli, info string, infoType string) ([]*
 
 	mkind := dcs[0].GetKind()
 	// mconfImage := dcs[0].GetContainerImage()
-	syncMonitorPath := config.MonitroSync.Config[KEY_DATA_DIR].(string)
+	syncMonitorPath, ok := config.MonitroSync.Config[KEY_DATA_DIR].(string)
+	if !ok || syncMonitorPath == "" {
+		return nil, fmt.Errorf("monitor_sync.config.data_dir is required")
+	}
+	var hostIps []string
+	var nodeTargets string
+	if config.NodeExporter.Deploy != nil {
+		hostIps, nodeTargets, err = monitorNodeTargets(&config, ctx, dingocli.ClusterName())
+		if err != nil {
+			return nil, err
+		}
+	}
 	roles := []string{}
 	switch {
 	case config.NodeExporter.Deploy != nil:
@@ -382,9 +480,15 @@ func ParseMonitorInfo(dingocli *cli.DingoCli, info string, infoType string) ([]*
 		roles = append(roles, ROLE_MONITOR_SYNC)
 	}
 	ret := []*MonitorConfig{}
+	if err := validateMonitorPlacement(&config, ctx, roles); err != nil {
+		return nil, err
+	}
 	for _, role := range roles {
 		// prometheus/grafana use as default host
 		serviceHosts := getHost(&config, role)
+		if len(serviceHosts) == 0 {
+			return nil, fmt.Errorf("no host configured for monitor role %s", role)
+		}
 		host := serviceHosts[0]
 		switch role {
 		case ROLE_PROMETHEUS:
@@ -394,6 +498,7 @@ func ParseMonitorInfo(dingocli *cli.DingoCli, info string, infoType string) ([]*
 			}
 			if config.NodeExporter.Deploy != nil {
 				config.Prometheus.Config[KEY_NODE_IPS] = hostIps
+				config.Prometheus.Config[KEY_NODE_TARGETS] = nodeTargets
 				config.Prometheus.Config[KRY_NODE_LISTEN_PORT] = config.NodeExporter.Config[KEY_LISTEN_PORT]
 				config.Prometheus.Config[KEY_CONF_DIR] = syncMonitorPath + "/" + ROLE_PROMETHEUS
 				config.Prometheus.Config[KEY_DATA_DIR] = syncMonitorPath + "/" + ROLE_PROMETHEUS + "/data"
@@ -427,7 +532,7 @@ func ParseMonitorInfo(dingocli *cli.DingoCli, info string, infoType string) ([]*
 			},
 			)
 		case ROLE_NODE_EXPORTER:
-			for hostSequence, h := range hosts {
+			for hostSequence, h := range serviceHosts {
 				ret = append(ret, &MonitorConfig{
 					kind:         mkind,
 					id:           fmt.Sprintf("%s_%s", role, h),

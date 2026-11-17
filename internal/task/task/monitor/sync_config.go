@@ -17,6 +17,7 @@
 package monitor
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -110,12 +111,8 @@ func MutateTool(vars *variable.Variables, delimiter string) step.Mutate {
 	}
 }
 
-func getNodeExporterAddrs(hosts []string, port int) string {
-	endpoint := []string{}
-	for _, item := range hosts {
-		endpoint = append(endpoint, fmt.Sprintf("'%s:%d'", item, port))
-	}
-	return fmt.Sprintf("[%s]", strings.Join(endpoint, ","))
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
 func NewSyncConfigTask(dingocli *cli.DingoCli, cfg *configure.MonitorConfig) (*task.Task, error) {
@@ -164,9 +161,7 @@ func NewSyncConfigTask(dingocli *cli.DingoCli, cfg *configure.MonitorConfig) (*t
 		})
 
 		// replace node exporter addrs
-		nodeHosts := cfg.GetNodeIps()
-		nodePort := cfg.GetNodeListenPort()
-		nodeExporterAddrs := getNodeExporterAddrs(nodeHosts, nodePort)
+		nodeTargets := base64.StdEncoding.EncodeToString([]byte(cfg.GetNodeTargets()))
 
 		// install sync_prometheus.sh
 		t.AddStep(&step.InstallFile{
@@ -176,9 +171,8 @@ func NewSyncConfigTask(dingocli *cli.DingoCli, cfg *configure.MonitorConfig) (*t
 		})
 
 		t.AddStep(&step.Command{
-			// quote the addrs argument: it contains '[...]' which zsh would
-			// treat as a glob pattern and reject with 'no matches found'
-			Command:     fmt.Sprintf("bash %s/sync_prometheus.sh %s/prometheus.yml \"%s\"", cfg.GetConfDir(), cfg.GetConfDir(), nodeExporterAddrs),
+			// Keep addresses and resource labels as base64 JSON, not shell code.
+			Command:     fmt.Sprintf("bash %s %s %s %s", shellQuote(cfg.GetConfDir()+"/sync_prometheus.sh"), shellQuote(cfg.GetConfDir()+"/prometheus.yml"), shellQuote(nodeTargets), shellQuote(cfg.GetHost())),
 			Out:         &out,
 			ExecOptions: dingocli.ExecOptions(),
 		})

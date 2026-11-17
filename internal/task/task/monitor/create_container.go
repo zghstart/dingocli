@@ -168,12 +168,16 @@ func NewCreateContainerTask(dingocli *cli.DingoCli, cfg *configure.MonitorConfig
 		Paths:       paths,
 		ExecOptions: options,
 	})
+	envs := getEnvironments(cfg)
+	if role == ROLE_MONITOR_SYNC {
+		envs = append(envs, "DINGO_MONITOR_CLUSTER="+dingocli.ClusterName())
+	}
 	t.AddStep(&step.CreateContainer{
 		Image:       cfg.GetImage(),
 		Entrypoint:  getEntrypoint(cfg),
 		Command:     getArguments(cfg),
 		AddHost:     []string{fmt.Sprintf("%s:127.0.0.1", hostname)},
-		Envs:        getEnvironments(cfg),
+		Envs:        envs,
 		Hostname:    hostname,
 		Init:        dingocli.Engine() == common.ENGINE_DOCKER,
 		Name:        hostname,

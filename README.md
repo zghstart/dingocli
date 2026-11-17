@@ -149,3 +149,24 @@ use repeated `-l` flags instead.
 For example, `-l 'literal:hosts-inspect:site-a'` selects the complete scope label
 with `hosts list`, and `-l 'literal:re:something'` selects the literal label
 `re:something`. It can also follow `!` or `&`.
+
+## P0 monitoring host coverage
+
+`node_exporter.deploy` selects all monitoring hosts, including Client/Cache hosts
+outside the metadata-service topology. Register them in `dingo hosts` first.
+Unknown hosts and multiple aliases for the same address are rejected. Explicit
+`deploy` hosts for Prometheus, Grafana and monitor_sync take precedence over the
+first node-exporter host. The three central services must share one host because
+their provisioned endpoints are local; split placements are rejected before deployment.
+
+The node sync step writes a deduplicated, atomic `node-targets.json` with
+`cluster/node/component` labels and one file_sd scrape job. Repeating the step does
+not append duplicate jobs. Application and node-exporter `instance` values retain
+their actual host:port; correlate their stable node identity instead of stripping
+ports. monitor_sync receives the selected cluster identity through
+`DINGO_MONITOR_CLUSTER` and uses the matching DingoFS discovery implementation.
+
+Pair this CLI with DingoFS `scripts/monitor/P0.md` and the Ansible P0 asset overlay.
+Changing registered monitor host coverage on an existing stack requires the normal
+monitor configuration/deployment workflow; copying dashboards alone does not
+create the missing node-exporter services.

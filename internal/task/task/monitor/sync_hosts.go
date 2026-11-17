@@ -63,7 +63,7 @@ func NewSyncHostsMappingTask(dingocli *cli.DingoCli, cfg *configure.MonitorConfi
 	})
 
 	// extract host /etc/hosts ip mapping into prometheus container
-	mutate_hosts := fmt.Sprintf(cfg.GetConfDir() + "/mutate_hosts")
+	mutate_hosts := cfg.GetConfDir() + "/mutate_hosts"
 
 	t.AddStep(&step.InstallFile{
 		HostDestPath: fmt.Sprintf("%s/extract_hosts.sh", cfg.GetConfDir()),
